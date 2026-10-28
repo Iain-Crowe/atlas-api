@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import logging
+import sqlite3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,7 +16,17 @@ logging.basicConfig(
 
 logger = logging.getLogger("atlas-api")
 
+from app.telemetry import initialize as initialize_telemetry
+from app.telemetry_routes import router as telemetry_router
+from app.jellyfin_routes import router as jellyfin_router
+from app.pihole_routes import router as pihole_router
+from app.media_routes import router as media_router
+from app.node_routes import router as node_router
+from app.maintenance_routes import router as maintenance_router
+from app.power_routes import router as power_router
 from app.database import Base, engine, get_db
+from app.resource_models import ResourceSnapshot
+from app.services.runtime.agent import get_service_resources
 from app.db_models import User, ManagedService
 from app.models import (
     RuntimeInfo,
@@ -54,9 +65,20 @@ from app.services.runtime.agent import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    try:
+        initialize_telemetry()
+    except (sqlite3.Error, OSError, RuntimeError):
+        logger.exception("History storage initialization failed; live API remains available")
     yield
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(telemetry_router)
+app.include_router(jellyfin_router)
+app.include_router(pihole_router)
+app.include_router(media_router)
+app.include_router(maintenance_router)
+app.include_router(power_router)
+app.include_router(node_router)
 
 # === Health Endpoint ===
 @app.get("/health")
@@ -153,6 +175,9 @@ def perform_service_action(
             detail="Service not found",
         )
 
+    if service.name == "jellyfin" or service.runtime_name == "jellyfin":
+        raise HTTPException(409, "Jellyfin runs on the Cronus VM; remote controls are not enabled")
+
     if service.runtime_type != "docker":
         raise HTTPException(
             status_code=400,
@@ -242,11 +267,18 @@ def list_services(
     services = get_managed_services(db)
 
     response: list[ManagedServiceResponse] = []
+    try:
+        remote = get_service_resources().readings.get("cronus-jellyfin/jellyfin")
+    except (OSError, RuntimeError, ValueError):
+        remote = None
 
     for service in services:
         runtime: RuntimeInfo | None = None
 
-        if service.runtime_type == "docker" and service.runtime_name:
+        is_remote = service.name == "jellyfin"
+        if is_remote:
+            runtime = RuntimeInfo(state=remote.state) if remote else None
+        elif service.runtime_type == "docker" and service.runtime_name:
             try:    
                 result = get_runtime_status(service.runtime_name)
 
@@ -261,7 +293,11 @@ def list_services(
                 id=service.id,
                 name=service.name,
                 display_name=service.display_name,
-                runtime_type=service.runtime_type,
+                node_id="cronus-jellyfin" if is_remote else "atlas",
+                node_label="Cronus VM" if is_remote else "Atlas",
+                controls_available=not is_remote,
+                resource_key="cronus-jellyfin/jellyfin" if is_remote else service.runtime_name,
+                runtime_type="remote_docker" if is_remote else service.runtime_type,
                 runtime_name=service.runtime_name,
                 runtime=runtime
             )
@@ -269,6 +305,20 @@ def list_services(
 
     return response
   
+@app.get("/services/resources", response_model=ResourceSnapshot)
+def service_resources(
+    current_user: User = Depends(require_role("viewer")),
+    db: Session = Depends(get_db),
+) -> ResourceSnapshot:
+    names = {"cronus-jellyfin/jellyfin" if s.name == "jellyfin" else s.runtime_name
+             for s in get_managed_services(db) if s.runtime_type == "docker"}
+    try:
+        snapshot = get_service_resources()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(503, "Service telemetry is temporarily unavailable") from exc
+    return ResourceSnapshot(ok=True, readings={name:row for name,row in snapshot.readings.items() if name in names})
+
+
 @app.post("/services", response_model=ManagedServiceResponse)
 async def add_service(
     service: ManagedServiceCreate,
@@ -307,14 +357,14 @@ def minecraft_status(
             detail="Service not found",
         )
 
-    if service.name != "minecraft":
+    if service.runtime_type != "docker" or service.runtime_name not in {"minecraft", "minecraft-craftbox"}:
         raise HTTPException(
             status_code=400,
             detail="Service is not a Minecraft service",
         )
 
     try:
-        result = get_minecraft_status()
+        result = get_minecraft_status(service.runtime_name)
     except OSError as exc:
         raise HTTPException(
             status_code=503,
@@ -367,3 +417,11 @@ async def login(
         access_token=access_token,
         token_type="bearer"
 )
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_session(current_user: User = Depends(get_current_user)) -> TokenResponse:
+    """Renew a still-valid session using the active user's current database role."""
+    return TokenResponse(
+        access_token=create_access_token(username=current_user.username, role=current_user.role),
+        token_type="bearer",
+    )
