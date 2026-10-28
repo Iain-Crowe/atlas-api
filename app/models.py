@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict
 
 # === System Status Models ===
 class CPUStatus(BaseModel):
-    usage_percent: float
+    usage_percent: float | None
     temperature_c: float | None
 
 class MemoryStatus(BaseModel):
@@ -58,6 +58,10 @@ class RuntimeInfo(BaseModel):
     state: str
 
 class ManagedServiceResponse(BaseModel):
+    node_id: str = "atlas"
+    node_label: str = "Atlas"
+    controls_available: bool = True
+    resource_key: str | None = None
     id: int
     name: str
     display_name: str
@@ -109,7 +113,7 @@ class SystemTelemetrySuccess(TypedDict):
     hostname: str
     uptime_seconds: float
     load_average: list[float]
-    cpu_usage_percent: float
+    cpu_usage_percent: float | None
     cpu_temperature_c: float | None
     memory_total_mb: float
     memory_available_mb: float
